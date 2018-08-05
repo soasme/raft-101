@@ -8,7 +8,7 @@ from random import uniform, seed
 from functools import partial
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 def gen_randtime_stream(init_time, minimum, maximum):
     seed(init_time)
