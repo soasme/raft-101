@@ -110,9 +110,10 @@ def main(bind, peers):
     udp_server.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
     udp_server.bind((host, port))
 
-    raft_stream = gen_raft_stream(start_epoch, udp_server, bind, peers)
-    for raft_state in raft_stream:
-        logger.debug(f'cluster current state: {raft_state}')
+    while True:
+        raft_stream = gen_raft_stream(start_epoch, udp_server, bind, peers)
+        for raft_state in raft_stream:
+            logger.debug(f'cluster current state: {raft_state}')
 
 
 
