@@ -63,6 +63,8 @@ def make_fixednum_stream(fixed_num):
 @dataclass
 class State:
 
+    role: str
+
     current_term: int
     voted_for: str
     log: list
@@ -76,6 +78,7 @@ class State:
     @classmethod
     def from_(state, **kwargs):
         return State(
+            role=kwargs.get('role') or state.role or 'follower',
             current_term=kwargs.get('current_term') or state.current_term,
             voted_for=kwargs.get('voted_for') or state.voted_for,
             log=kwargs.get('log') or state.log,
@@ -164,6 +167,28 @@ def make_periodical_rpc_stream(udp_server, timeout):
         rpc_data = None
     return Stream(rpc_data, partial(make_periodical_rpc_stream, udp_server, timeout))
 
+
+def apply_server_rules(config, state, state_machine, udp_server, rpc_stream):
+    state = validate_commit_index(state_machine, state)
+    rpc_data = rpc_stream.first
+    state = validate_term(udp_server, config['peers'], rpc_data, state)
+    if state == 'follower':
+        respond_rpc(udp_server, rpc_data)
+        if rpc_data is None:
+            state = State.from_(state, role='candidate')
+            state = start_election(udp_server, state)
+    elif state == 'candidate':
+        votes = collect_votes(rpc_stream)
+        if is_majority_accepted(votes):
+            state = State.from_(state, role='leader')
+            send_initial_heartbeat(udp_server, state)
+        elif is_append_entries_received(votes):
+            state = State.from_(state, role='follower')
+        elif is_no_votes_received(votes):
+            state = start_election(udp_server, state)
+    elif state == 'leader':
+        pass
+    return state
 
 def make_raft_stream(config):
     start_epoch = time()
