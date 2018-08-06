@@ -49,11 +49,16 @@ def filter_stream(fn, s):
     return compute_rest()
 
 
+# follower and candidate needs it to gather votes or append_entries.
 def make_randseq_stream(seed_number, minimum, maximum):
     seed(seed_number)
     rand = uniform(minimum, maximum)
     return Stream(rand,
                   partial(make_randseq_stream, rand, minimum, maximum))
+
+# leader needs this to send periodical broadcast.
+def make_fixednum_stream(fixed_num):
+    return Stream(fixed_num, lambda: fixed_num)
 
 @dataclass
 class State:
@@ -90,6 +95,7 @@ def make_udp_server(config):
     udp_server.bind((host, port))
     return udp_server
 
+# server rule 1: apply those not applied to local log.
 def validate_commit_index(state_machine, state):
     last_applied = state.last_applied
     if state.commit_index > state.last_applied:
@@ -99,6 +105,9 @@ def validate_commit_index(state_machine, state):
             last_applied += 1
     return State.from_(state, last_applied=last_applied)
 
+# server rule 2:
+# * accept the other leader (by turning itself as follower)
+# * reject the other leader (by sending a response with `success=false`)
 def validate_term(udp_server, peers, data, state):
     if data['term'] > state.term:
         state = State.from_(state, term=data['term'], role='follower')
@@ -116,6 +125,19 @@ class RpcData:
 
     payload: dict
     address: str
+
+def make_rpc_stream(udp_server, timeout_stream):
+    timeout = timeout_stream.first
+    if timeout <= 0:
+        rpc_data = None
+    else:
+        udp_server.settimeout(timeout)
+        try:
+            datagram, address = udp_server.recvfrom(8192)
+            rpc_data = RpcData(json.loads(datagram.decode()), address)
+        except socket.timeout:
+            rpc_data = None
+    return Stream(rpc_data, partial(make_rpc_stream, udp_server, timeout_stream.rest))
 
 def make_consequent_rpc_stream(udp_server, period):
     address = None
