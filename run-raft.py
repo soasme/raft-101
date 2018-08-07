@@ -48,10 +48,16 @@ def filter_stream(fn, s):
         return Stream(s.first, compute_rest)
     return compute_rest()
 
+def stream_to_list(s):
+    r = []
+    while not s.empty:
+        r.append(s.first)
+        s = s.rest
+    return r
+
 
 # follower and candidate needs it to gather votes or append_entries.
 def make_randseq_stream(seed_number, minimum, maximum):
-    seed(seed_number)
     rand = uniform(minimum, maximum)
     return Stream(rand,
                   partial(make_randseq_stream, rand, minimum, maximum))
@@ -59,6 +65,72 @@ def make_randseq_stream(seed_number, minimum, maximum):
 # leader needs this to send periodical broadcast.
 def make_fixednum_stream(fixed_num):
     return Stream(fixed_num, lambda: fixed_num)
+
+# candidate needs this to gather votes during election.
+def make_decseq_stream(start):
+    if start <= 0:
+        rand = None
+    else:
+        rand = uniform(0, start)
+    def rest():
+        return make_decseq_stream(start - rand)
+    return Stream(rand, rest, empty=rand is None)
+
+def make_udp_server(config):
+    bind = config['bind']
+    host, port = bind.split(':')
+    host, port = host or '0.0.0.0', int(port)
+    udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_server.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    udp_server.bind((host, port))
+    return udp_server
+
+# the udp server create a stream based on the timeout stream.
+# it gives an rpc_data if receives stuff before timeout.
+# it gives null if timeout.
+def make_rpc_stream(udp_server, timeout_stream):
+    timeout = timeout_stream.first
+    if timeout <= 0 or timeout_stream.empty:
+        rpc_data = None
+    else:
+        udp_server.settimeout(timeout)
+        try:
+            datagram, address = udp_server.recvfrom(8192)
+            rpc_data = RpcData(json.loads(datagram.decode()), address)
+        except socket.timeout:
+            rpc_data = None
+    return Stream(rpc_data,
+            partial(make_rpc_stream, udp_server, timeout_stream.rest),
+            empty=rpc_data is None)
+
+
+def make_follower_stream(udp_server, state, timer_stream=None, rpc_stream=None):
+    timer_stream = timer_stream or make_randseq_stream(time(), 0.150, 0.300)
+    rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
+    if rpc_stream.empty: # -> candidate
+        state = None
+    else:
+        response = rpc_stream.first
+        state = follower_respond_rpc(response, state) # @follower
+    def rest():
+        return make_follower_stream(udp_server, state, timer_stream, rpc_stream)
+    return Stream(state, rest, empty=state is None)
+
+def make_candidate_stream(udp_server, state, timer_stream=None, rpc_stream=None):
+    timer_stream = timer_stream or make_decseq_stream(uniform(0.150, 0.300))
+    rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
+    if rpc_stream.empty: # -> follower
+        state = None
+    else:
+        responses = stream_to_list(rpc_stream)
+        state = candidate_respond_rpc(responses, state) # ->leader, ->follower
+    def rest():
+        return make_candidate_stream(udp_server, state, timer_stream, rpc_stream)
+    return Stream(state, rest, empty=state is None)
+
+def make_leader_stream(udp_server, state):
+    pass
 
 @dataclass
 class State:
@@ -88,15 +160,6 @@ class State:
             match_index=kwargs.get('match_index') or match_index,
         )
 
-def make_udp_server(config):
-    bind = config['bind']
-    host, port = bind.split(':')
-    host, port = host or '0.0.0.0', int(port)
-    udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_server.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    udp_server.bind((host, port))
-    return udp_server
 
 # server rule 1: apply those not applied to local log.
 def validate_commit_index(state_machine, state):
@@ -172,12 +235,12 @@ def apply_server_rules(config, state, state_machine, udp_server, rpc_stream):
     state = validate_commit_index(state_machine, state)
     rpc_data = rpc_stream.first
     state = validate_term(udp_server, config['peers'], rpc_data, state)
-    if state == 'follower':
-        respond_rpc(udp_server, rpc_data)
+    if state.role == 'follower':
+        state = follower_respond_rpc(udp_server, state)
         if rpc_data is None:
             state = State.from_(state, role='candidate')
             state = start_election(udp_server, state)
-    elif state == 'candidate':
+    elif state.role == 'candidate':
         votes = collect_votes(rpc_stream)
         if is_majority_accepted(votes):
             state = State.from_(state, role='leader')
@@ -186,7 +249,7 @@ def apply_server_rules(config, state, state_machine, udp_server, rpc_stream):
             state = State.from_(state, role='follower')
         elif is_no_votes_received(votes):
             state = start_election(udp_server, state)
-    elif state == 'leader':
+    elif state.role == 'leader':
         pass
     return state
 
