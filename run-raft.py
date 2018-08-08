@@ -106,9 +106,43 @@ def make_rpc_stream(udp_server, timeout_stream):
             rpc_data = RpcData(json.loads(datagram.decode()), address)
         except socket.timeout:
             rpc_data = None
-    return Stream(rpc_data,
-            partial(make_rpc_stream, udp_server, timeout_stream.rest),
-            empty=rpc_data is None)
+    def rest():
+        return make_rpc_stream(udp_server, timeout_stream.rest)
+    return Stream(rpc_data, rest, empty=rpc_data is None)
+
+class NewTermDiscovered(Exception):
+    pass
+
+class NewLeaderDiscovered(Exception):
+    pass
+
+def make_state_stream(config, state=None, role=None, state_stream=None):
+    start_epoch = time()
+    udp_server = make_udp_server(config)
+    state = state or State(current_term=0, voted_for=None, log=[], commit_index=0,
+                           last_applied=0, next_index=[], match_index=[])
+    role = role or 'follower'
+    state_stream = state_stream or make_follower_stream(udp_server, state)
+
+    if role == 'follower' and state_stream.empty:
+        role, state_stream = 'candidate', make_candidate_stream(udp_server, state)
+    elif role == 'follower' and not state_stream.empty:
+        state_stream = state_stream.rest
+    elif role == 'candidate' and state_stream.empty:
+        # -> leader or -> follower.
+        role, state_stream = 'leader', make_leader_stream(udp_server, state)
+    elif role == 'candidate' and not state_stream.empty:
+        state_stream = state_stream.rest
+    elif role == 'leader' and state_stream.empty:
+        role, state_stream = 'follower', make_follower_stream(udp_server, state)
+    elif role == 'leader' and not state_stream.empty:
+        state_stream = state_stream.rest
+
+    state = state_stream.first
+
+    def rest():
+        return make_state_stream(config, state, role, state_stream)
+    return Stream((role, state), rest)
 
 
 def make_follower_stream(udp_server, state, timer_stream=None, rpc_stream=None):
@@ -126,11 +160,10 @@ def make_follower_stream(udp_server, state, timer_stream=None, rpc_stream=None):
 def make_candidate_stream(udp_server, state, timer_stream=None, rpc_stream=None):
     timer_stream = timer_stream or make_decseq_stream(uniform(0.150, 0.300))
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    if rpc_stream.empty: # -> follower, (restart election) # can also stay candidate?
-        state = None
+    if rpc_stream.empty: # -> restart election
+        state = new_election(udp_server, state)
     else: # -> handle majority votes or discover another leader & new term.
-        responses = stream_to_list(rpc_stream) # potential issue: only need to receive majority.
-        state = candidate_respond_rpc(responses, state) # ->leader, ->follower
+        state = candidate_respond_rpc(rpc_stream, state) # ->leader, ->follower
     def rest():
         return make_candidate_stream(udp_server, state, timer_stream, rpc_stream)
     return Stream(state, rest, empty=rpc_stream.empty)
@@ -140,8 +173,7 @@ def make_leader_stream(udp_server, state, heartbeat_stream=None,
     heartbeat_stream = heartbeat_stream or make_fixednum_stream(0.300)
     timer_stream = timer_stream or make_decseq_stream(0.300)
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    responses = stream_to_list(rpc_stream)
-    state = leader_respond_rpc(responses, state)
+    state = leader_respond_rpc(rpc_stream, state)
     def rest():
         return make_leader_stream(udp_server, state, heartbeat_stream, timer_stream, rpc_stream)
     return Stream(state, rest) # Can leader rule life-long? Good question.
