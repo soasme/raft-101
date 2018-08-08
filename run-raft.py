@@ -55,7 +55,6 @@ def stream_to_list(s):
         s = s.rest
     return r
 
-
 # follower and candidate needs it to gather votes or append_entries.
 def make_randseq_stream(seed_number, minimum, maximum):
     rand = uniform(minimum, maximum)
@@ -76,6 +75,13 @@ def make_decseq_stream(start):
         return make_decseq_stream(start - rand)
     return Stream(rand, rest, empty=rand is None)
 
+# leader needs this to step down to follower
+def make_countdown_stream(start):
+    def rest():
+        return make_countdown_stream(start - 1)
+    return Stream(start, rest, empty=(start==0))
+
+# all server need this to send datagram to other servers.
 def make_udp_server(config):
     bind = config['bind']
     host, port = bind.split(':')
@@ -108,29 +114,37 @@ def make_rpc_stream(udp_server, timeout_stream):
 def make_follower_stream(udp_server, state, timer_stream=None, rpc_stream=None):
     timer_stream = timer_stream or make_randseq_stream(time(), 0.150, 0.300)
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    if rpc_stream.empty: # -> candidate
-        state = None
-    else:
+    if rpc_stream.empty: # -> candidate (timeout, start election)
+        state = convert_to_candidate(state)
+    else: # -> respond append_entries & request_vote
         response = rpc_stream.first
         state = follower_respond_rpc(response, state) # @follower
     def rest():
         return make_follower_stream(udp_server, state, timer_stream, rpc_stream)
-    return Stream(state, rest, empty=state is None)
+    return Stream(state, rest, empty=rpc_stream.empty)
 
 def make_candidate_stream(udp_server, state, timer_stream=None, rpc_stream=None):
     timer_stream = timer_stream or make_decseq_stream(uniform(0.150, 0.300))
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    if rpc_stream.empty: # -> follower
+    if rpc_stream.empty: # -> follower, (restart election) # can also stay candidate?
         state = None
-    else:
-        responses = stream_to_list(rpc_stream)
+    else: # -> handle majority votes or discover another leader & new term.
+        responses = stream_to_list(rpc_stream) # potential issue: only need to receive majority.
         state = candidate_respond_rpc(responses, state) # ->leader, ->follower
     def rest():
         return make_candidate_stream(udp_server, state, timer_stream, rpc_stream)
-    return Stream(state, rest, empty=state is None)
+    return Stream(state, rest, empty=rpc_stream.empty)
 
-def make_leader_stream(udp_server, state):
-    pass
+def make_leader_stream(udp_server, state, heartbeat_stream=None,
+        timer_stream=None, rpc_stream=None):
+    heartbeat_stream = heartbeat_stream or make_fixednum_stream(0.300)
+    timer_stream = timer_stream or make_decseq_stream(0.300)
+    rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
+    responses = stream_to_list(rpc_stream)
+    state = leader_respond_rpc(responses, state)
+    def rest():
+        return make_leader_stream(udp_server, state, heartbeat_stream, timer_stream, rpc_stream)
+    return Stream(state, rest) # Can leader rule life-long? Good question.
 
 @dataclass
 class State:
