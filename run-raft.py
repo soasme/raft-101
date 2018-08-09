@@ -3,83 +3,73 @@ import sys
 import socket
 import logging
 import itertools as it
+from uuid import uuid4
 from time import time, sleep
 from random import uniform, seed
 from functools import partial
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 class Stream(object):
-    """A lazily computed recursive list."""
-    def __init__(self, first, compute_rest, empty=False):
-        self.first = first
-        self._compute_rest = compute_rest
-        self.empty = empty
+    def __init__(self, head, rest_fn, exit=None):
+        self.head = head
+        self.exit = exit
         self._rest = None
-        self._computed = False
+        self._rest_fn = rest_fn
+        self._evaluated = False
+
+    @property
+    def stopped(self):
+        return self.exit is None
+
     @property
     def rest(self):
-        """Return the rest of the stream, computing it if necessary."""
-        assert not self.empty, 'Empty streams have no rest.'
-        if not self._computed:
-            self._rest = self._compute_rest()
-            self._computed = True
+        assert self.stopped, 'Stopped streams have no rest.'
+        if not self._evaluated:
+            self._rest = self._rest_fn()
+            self._evaluated = True
         return self._rest
+
     def __repr__(self):
-        if self.empty:
-            return '<empty stream>'
-        return 'Stream({0}, <compute_rest>)'.format(repr(self.first))
+        if self.stopped:
+            return '<Stream stopped>'
+        return 'Stream({0}, <rest_fn>)'.format(repr(self.head))
 
 def map_stream(fn, s):
-    if s.empty:
+    if s.stopped:
         return s
-    def compute_rest():
+    def rest_fn():
         return map_stream(fn, s.rest)
-    return Stream(fn(s.first), compute_rest)
+    return Stream(fn(s.head), rest_fn)
 
 def filter_stream(fn, s):
-    if s.empty:
+    if s.stopped:
         return s
-    def compute_rest():
+    def rest_fn():
         return filter_stream(fn, s.rest)
-    if fn(s.first):
-        return Stream(s.first, compute_rest)
-    return compute_rest()
-
-def stream_to_list(s):
-    r = []
-    while not s.empty:
-        r.append(s.first)
-        s = s.rest
-    return r
+    if fn(s.head):
+        return Stream(s.head, rest_fn)
+    return rest_fn()
 
 # follower and candidate needs it to gather votes or append_entries.
+# randseq stream never stop.
 def make_randseq_stream(seed_number, minimum, maximum):
-    rand = uniform(minimum, maximum)
-    return Stream(rand,
-                  partial(make_randseq_stream, rand, minimum, maximum))
+    head = uniform(minimum, maximum)
+    rest = lambda: make_randseq_stream(head, minimum, maximum)
+    return Stream(head, rest)
 
 # leader needs this to send periodical broadcast.
+# fixednum stream never stop.
 def make_fixednum_stream(fixed_num):
     return Stream(fixed_num, lambda: fixed_num)
 
-# candidate needs this to gather votes during election.
-def make_decseq_stream(start):
-    if start <= 0:
-        rand = None
-    else:
-        rand = uniform(0, start)
-    def rest():
-        return make_decseq_stream(start - rand)
-    return Stream(rand, rest, empty=rand is None)
-
 # leader needs this to step down to follower
 def make_countdown_stream(start):
-    def rest():
-        return make_countdown_stream(start - 1)
-    return Stream(start, rest, empty=(start==0))
+    exit = start <= 0
+    rest = lambda: make_countdown_stream(start - 1)
+    return Stream(start, rest, exit=exit)
 
 # all server need this to send datagram to other servers.
 def make_udp_server(config):
@@ -95,83 +85,89 @@ def make_udp_server(config):
 # the udp server create a stream based on the timeout stream.
 # it gives an rpc_data if receives stuff before timeout.
 # it gives null if timeout.
-def make_rpc_stream(udp_server, timeout_stream):
-    timeout = timeout_stream.first
-    if timeout <= 0 or timeout_stream.empty:
-        rpc_data = None
-    else:
-        udp_server.settimeout(timeout)
-        try:
-            datagram, address = udp_server.recvfrom(8192)
-            rpc_data = RpcData(json.loads(datagram.decode()), address)
-        except socket.timeout:
-            rpc_data = None
-    def rest():
-        return make_rpc_stream(udp_server, timeout_stream.rest)
-    return Stream(rpc_data, rest, empty=rpc_data is None)
 
-class NewTermDiscovered(Exception):
-    pass
+def log_transition(state, from_, to):
+    logger.info(f'{state.config["id"]} {state.config["bind"]} convert from {from_} to {to}.')
 
-class NewLeaderDiscovered(Exception):
-    pass
-
-def make_state_stream(config, state=None, role=None, state_stream=None):
+def make_state_stream(config, state=None, role=None, udp_server=None, state_stream=None):
     start_epoch = time()
-    udp_server = make_udp_server(config)
-    state = state or State(current_term=0, voted_for=None, log=[], commit_index=0,
-                           last_applied=0, next_index=[], match_index=[])
+    udp_server = udp_server or make_udp_server(config)
+    state = state or State(config=config, current_term=0, voted_for=None,
+                           commit_index=0, last_applied=0, next_index=[], match_index=[],
+                           log=[{'term': 0, 'cmd': {}}])
     role = role or 'follower'
     state_stream = state_stream or make_follower_stream(udp_server, state)
 
-    if role == 'follower' and state_stream.empty:
+    if role == 'follower' and not state_stream.stopped:
+        state_stream = state_stream.rest
+    elif role == 'follower' and state_stream.stopped:
+        log_transition(state, 'follower', 'candidate')
         role, state_stream = 'candidate', make_candidate_stream(udp_server, state)
-    elif role == 'follower' and not state_stream.empty:
-        state_stream = state_stream.rest
-    elif role == 'candidate' and state_stream.empty:
-        # -> leader or -> follower.
-        role, state_stream = 'leader', make_leader_stream(udp_server, state)
-    elif role == 'candidate' and not state_stream.empty:
-        state_stream = state_stream.rest
-    elif role == 'leader' and state_stream.empty:
-        role, state_stream = 'follower', make_follower_stream(udp_server, state)
-    elif role == 'leader' and not state_stream.empty:
-        state_stream = state_stream.rest
+        logger.info('candidate stream stopped? %s', state_stream.stopped)
 
-    state = state_stream.first
+    elif role == 'candidate' and state_stream.exit == 'new_election':
+        role, state_stream = 'candidate', make_candidate_stream(udp_server, state)
+    elif role == 'candidate' and state_stream.exit == 'to_leader':
+        role, state_stream = 'leader', make_leader_stream(udp_server, state)
+        log_transition(state, 'candidate', 'leader')
+    elif role == 'candidate' and state_stream.exit == 'to_follower':
+        role, state_stream = 'follower', make_follower_stream(udp_server, state)
+        log_transition(state, 'candidate', 'follower')
+    elif role == 'candidate':
+        raise Exception('candidate stream bad condition. head=%s exit=%s', state_stream.head, state_stream.exit)
+
+    elif role == 'leader' and not state_stream.stopped:
+        state_stream = state_stream.rest
+    elif role == 'leader' and state_stream.stopped:
+        role, state_stream = 'follower', make_follower_stream(udp_server, state)
+        log_transition(state, 'leader', 'follower')
+
+    state = state_stream.head
 
     def rest():
-        return make_state_stream(config, state, role, state_stream)
+        return make_state_stream(config, state, role, udp_server, state_stream)
     return Stream((role, state), rest)
 
+def elect_self(udp_server, state):
+    logger.debug(f'start election from term={state.current_term}')
+    state = State.from_(state, current_term=state.current_term+1,
+                        voted_for=state.config['id'])
+    broadcast(udp_server, state.config['peers'], {'type': 'request_vote', 'term': state.current_term,
+        'candidate_id': state.config['id'],
+        'last_log_index': len(state.log),
+        'last_log_term': state.log[-1]['term'],
+    })
+    logger.debug(f'{state.config["id"]} started election at term={state.current_term}.')
+    return state
 
 def make_follower_stream(udp_server, state, timer_stream=None, rpc_stream=None):
     timer_stream = timer_stream or make_randseq_stream(time(), 0.150, 0.300)
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    if rpc_stream.empty: # -> candidate (timeout, start election)
-        state = convert_to_candidate(state)
+    logger.debug(rpc_stream.stopped and 'candidate rpc stream stopped.' or 'xxx')
+    if rpc_stream.stopped: # -> candidate (timeout, start election)
+        state = elect_self(udp_server, state)
     else: # -> respond append_entries & request_vote
-        response = rpc_stream.first
+        response = rpc_stream.head
         state = follower_respond_rpc(response, state) # @follower
     def rest():
         return make_follower_stream(udp_server, state, timer_stream, rpc_stream)
-    return Stream(state, rest, empty=rpc_stream.empty)
+    return Stream(state, rest, exit=rpc_stream.exit)
 
 def make_candidate_stream(udp_server, state, timer_stream=None, rpc_stream=None):
-    timer_stream = timer_stream or make_decseq_stream(uniform(0.150, 0.300))
+    timer_stream = make_fixednum_stream(0.300)
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    if rpc_stream.empty: # -> restart election
-        state = new_election(udp_server, state)
-    else: # -> handle majority votes or discover another leader & new term.
-        state = candidate_respond_rpc(rpc_stream, state) # ->leader, ->follower
+    if rpc_stream.stopped: # -> restart election
+        next_state, exit = elect_self(udp_server, state), 'new_election'
+    else:
+        next_state, exit = candidate_respond_rpc(rpc_stream, state) # ->leader, ->follower
     def rest():
-        return make_candidate_stream(udp_server, state, timer_stream, rpc_stream)
-    return Stream(state, rest, empty=rpc_stream.empty)
+        return make_candidate_stream(udp_server, next_state)
+    return Stream(next_state, rest, exit=exit)
 
 def make_leader_stream(udp_server, state, heartbeat_stream=None,
         timer_stream=None, rpc_stream=None):
     heartbeat_stream = heartbeat_stream or make_fixednum_stream(0.300)
-    timer_stream = timer_stream or make_decseq_stream(0.300)
+    timer_stream = make_fixednum_stream(0.300)
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
     state = leader_respond_rpc(rpc_stream, state)
     def rest():
@@ -181,7 +177,7 @@ def make_leader_stream(udp_server, state, heartbeat_stream=None,
 @dataclass
 class State:
 
-    role: str
+    config: dict
 
     current_term: int
     voted_for: str
@@ -194,16 +190,16 @@ class State:
     match_index: list
 
     @classmethod
-    def from_(state, **kwargs):
-        return State(
-            role=kwargs.get('role') or state.role or 'follower',
+    def from_(cls, state, **kwargs):
+        return cls(
+            config=kwargs.get('config') or state.config,
             current_term=kwargs.get('current_term') or state.current_term,
             voted_for=kwargs.get('voted_for') or state.voted_for,
             log=kwargs.get('log') or state.log,
-            commit_index=kwargs.get('commit_index') or commit_index,
-            last_applied=kwargs.get('last_applied') or last_applied,
-            next_index=kwargs.get('next_index') or next_index,
-            match_index=kwargs.get('match_index') or match_index,
+            commit_index=kwargs.get('commit_index') or state.commit_index,
+            last_applied=kwargs.get('last_applied') or state.last_applied,
+            next_index=kwargs.get('next_index') or state.next_index,
+            match_index=kwargs.get('match_index') or state.match_index,
         )
 
 
@@ -238,18 +234,21 @@ class RpcData:
     payload: dict
     address: str
 
-def make_rpc_stream(udp_server, timeout_stream):
-    timeout = timeout_stream.first
+def get_rpc_data(udp_server, timeout):
     if timeout <= 0:
-        rpc_data = None
+        return None
     else:
         udp_server.settimeout(timeout)
         try:
             datagram, address = udp_server.recvfrom(8192)
-            rpc_data = RpcData(json.loads(datagram.decode()), address)
+            return RpcData(json.loads(datagram.decode()), address)
         except socket.timeout:
-            rpc_data = None
-    return Stream(rpc_data, partial(make_rpc_stream, udp_server, timeout_stream.rest))
+            return None
+
+def make_rpc_stream(udp_server, timeout_stream):
+    rpc_data = get_rpc_data(udp_server, timeout_stream.head)
+    rest = lambda: make_rpc_stream(udp_server, timer_stream.rest)
+    return Stream(rpc_data, rest)
 
 def make_consequent_rpc_stream(udp_server, period):
     address = None
@@ -279,7 +278,7 @@ def make_periodical_rpc_stream(udp_server, timeout):
 
 def apply_server_rules(config, state, state_machine, udp_server, rpc_stream):
     state = validate_commit_index(state_machine, state)
-    rpc_data = rpc_stream.first
+    rpc_data = rpc_stream.head
     state = validate_term(udp_server, config['peers'], rpc_data, state)
     if state.role == 'follower':
         state = follower_respond_rpc(udp_server, state)
@@ -299,35 +298,6 @@ def apply_server_rules(config, state, state_machine, udp_server, rpc_stream):
         pass
     return state
 
-def make_raft_stream(config):
-    start_epoch = time()
-    state_machine = {}
-    state = State(current_term=0, voted_for=None, log=[], commit_index=0,
-                  last_applied=0, next_index=[], match_index=[], role='follower')
-
-    def get_raft_next_state():
-        next_state = apply_uncommited_logs(state_machine, state)
-        return next_state
-
-    return Stream(state, get_raft_next_state)
-
-def gen_randtime_stream(init_time, minimum, maximum):
-    seed(init_time)
-    while True:
-        yield uniform(minimum, maximum)
-
-def gen_follower_stream(start_epoch, udp_server, bind):
-    election_timeout_stream = gen_randtime_stream(start_epoch, 0.150, 0.300)
-    for election_timeout in election_timeout_stream:
-        udp_server.settimeout(election_timeout)
-        try:
-            datagram = udp_server.recvfrom(8192)
-            # TODO: handle upstream commands
-            yield {'datagram': datagram}
-        except socket.timeout:
-            logger.debug(f'udp socket timeout after {election_timeout} seconds.')
-            return
-
 def broadcast(udp_server, targets, data):
     for target in targets:
         encode = json.dumps(data).encode()
@@ -336,89 +306,16 @@ def broadcast(udp_server, targets, data):
         udp_server.sendto(encode, (host, port))
         logger.debug(f'udp server has send {encode} to {target}.')
 
-def keep_receiving(udp_server, timeout):
-    start = time()
-    while timeout > 0:
-        try:
-            udp_server.settimeout(timeout)
-            datagram, addr = udp_server.recvfrom(8192)
-            logger.debug(f'udp socket has received a datagram.')
-            yield json.loads(datagram.decode()), addr
-            timeout -= (time() - start)
-        except socket.timeout:
-            logger.debug(f'udp socket timeout after {timeout} seconds when keep receiving datagrams.')
-            return
-
-def gen_candidate_stream(start_epoch, udp_server, bind, peers):
-    election_timeout_stream = gen_randtime_stream(start_epoch, 0.150, 0.300)
-    for election_timeout in election_timeout_stream:
-        request_vote = {'type': 'request_vote', 'candidate_id': bind, }
-        broadcast(udp_server, peers, request_vote)
-        data_stream = keep_receiving(udp_server, election_timeout)
-        data = list(data_stream)
-        if not data:
-            logger.debug(f'udp socket receives nothing so we create another request vote.')
-            continue
-        else:
-            # TODO: handle votes
-            yield {'votes': data}
-
-def gen_leader_stream(start_epoch, udp_server, bind, peers):
-    heartbeat_stream = gen_randtime_stream(start_epoch, 0.150, 0.300)
-    for heartbeat in heartbeat_stream:
-        append_entries = {'type': 'append_entries', 'leader_id': bind, }
-        broadcast(udp_server, peers, append_entries)
-        data_stream = keep_receiving(udp_server, heartbeat_timeout)
-        data = list(data_stream)
-        if not data:
-            logger.debug(f'udp socket receives nothing so we create another append entries.')
-            continue
-        else:
-            # TODO: handle append entries responses.
-            yield {'res': data}
-
-            # TODO: accept another leader.
-            current_term = 0 # = ?
-            for el in data:
-                if el['term'] > current_term:
-                    return
-
-def gen_raft_stream(start_epoch, udp_server, bind, peers):
-    follower_stream = gen_follower_stream(start_epoch, udp_server, bind)
-    for follower_state in follower_stream:
-        if follower_state is None:
-            break
-        yield dict(role='follower', bind=bind, **(follower_state or {}))
-    candidate_stream = gen_candidate_stream(start_epoch, udp_server, bind, peers)
-    for candidate_state in candidate_stream:
-        if candidate_state is None:
-            break
-        yield dict(role='candidate', bind=bind, peers=peers, **(candidate_state or {}))
-    leader_stream = gen_leader_stream(start_epoch, udp_server, bind, peers)
-    for leader_state in leader_stream:
-        if leader_state is None:
-            break
-        yield dict(role='leader', bind=bind, peers=peers)
-
 
 def main(bind, peers):
-    start_epoch = time()
-
-    host, port = bind.split(':')
-    host, port = host or '0.0.0.0', int(port)
-    udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_server.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    udp_server.bind((host, port))
-
-    randseqs = make_randseq_stream(start_epoch, 0.150, 0.300)
-    print(randseqs.first)
-    print(randseqs.rest.first)
-    # while True:
-        # raft_stream = gen_raft_stream(start_epoch, udp_server, bind, peers)
-        # for raft_state in raft_stream:
-            # logger.debug(f'cluster current state: {raft_state}')
-
+    state_stream = make_state_stream({
+        'id': str(uuid4()),
+        'bind': bind,
+        'peers': peers,
+    })
+    while True:
+        state = state_stream.head
+        state_stream = state_stream.rest
 
 
 if __name__ == '__main__':
