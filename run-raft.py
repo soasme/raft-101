@@ -10,7 +10,8 @@ from functools import partial
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
+
 
 class Stream(object):
     def __init__(self, head, rest_fn, exit=None):
@@ -22,11 +23,11 @@ class Stream(object):
 
     @property
     def stopped(self):
-        return self.exit is None
+        return self.exit is not None
 
     @property
     def rest(self):
-        assert self.stopped, 'Stopped streams have no rest.'
+        assert not self.stopped, 'Stopped stream has no rest.'
         if not self._evaluated:
             self._rest = self._rest_fn()
             self._evaluated = True
@@ -102,12 +103,14 @@ def make_state_stream(config, state=None, role=None, udp_server=None, state_stre
         state_stream = state_stream.rest
     elif role == 'follower' and state_stream.stopped:
         log_transition(state, 'follower', 'candidate')
-        role, state_stream = 'candidate', make_candidate_stream(udp_server, state)
-        logger.info('candidate stream stopped? %s', state_stream.stopped)
+        role, state_stream = 'candidate', Stream(state, lambda: make_candidate_stream(udp_server, state))
 
+    elif role == 'candidate' and not state_stream.stopped:
+        state_stream = state_stream.rest
     elif role == 'candidate' and state_stream.exit == 'new_election':
         role, state_stream = 'candidate', make_candidate_stream(udp_server, state)
     elif role == 'candidate' and state_stream.exit == 'to_leader':
+        logger.debug('leader got state: {state}, {state_stream}')
         role, state_stream = 'leader', make_leader_stream(udp_server, state)
         log_transition(state, 'candidate', 'leader')
     elif role == 'candidate' and state_stream.exit == 'to_follower':
@@ -126,10 +129,10 @@ def make_state_stream(config, state=None, role=None, udp_server=None, state_stre
 
     def rest():
         return make_state_stream(config, state, role, udp_server, state_stream)
-    return Stream((role, state), rest)
+
+    return Stream((role, state), rest, exit=None)
 
 def elect_self(udp_server, state):
-    logger.debug(f'start election from term={state.current_term}')
     state = State.from_(state, current_term=state.current_term+1,
                         voted_for=state.config['id'])
     broadcast(udp_server, state.config['peers'], {'type': 'request_vote', 'term': state.current_term,
@@ -137,41 +140,131 @@ def elect_self(udp_server, state):
         'last_log_index': len(state.log),
         'last_log_term': state.log[-1]['term'],
     })
-    logger.debug(f'{state.config["id"]} started election at term={state.current_term}.')
+    #logger.debug(f'{state.config["id"]} started election at term={state.current_term}.')
     return state
 
+def grant_vote(state, udp_server, rpc_data):
+    data = rpc_data.payload
+    logger.debug(f'try to grant vote: {data}, {state}')
+    if data['term'] > state.current_term:
+        sendto(udp_server, rpc_data.address, {
+            'type': 'request_vote_response',
+            'term': state.current_term,
+            'vote_granted': True,
+        })
+        return True
+    elif ((not state.voted_for or state.voted_for == data['candidate_id'])
+            and data['last_log_term'] <= state.log[-1]['term']):
+        logger.debug(f'{state.config["id"]} voted for {data["candidate_id"]}')
+        sendto(udp_server, rpc_data.address, {
+            'type': 'request_vote_response',
+            'term': state.current_term,
+            'vote_granted': True,
+        })
+        return True
+    else:
+        sendto(udp_server, rpc_data.address, {
+            'type': 'request_vote_response',
+            'term': state.current_term,
+            'vote_granted': False,
+        })
+        return False
+
+def follower_respond_rpc(udp_server, response, state):
+    data = response.payload
+    if data['type'] == 'request_vote':
+        if grant_vote(state, udp_server, response):
+            state = State.from_(state, voted_for=data['candidate_id'])
+        return state
+    elif data['type'] == 'append_entries':
+        if data['term'] < state.current_term:
+            success = False
+        elif data['prev_log_index'] > len(state.log):
+            success = False
+        else:
+            # please handle append_entries rpc .3.
+            state = State.from_(state, log=log[:data['prev_log_index']] + data['entries'],)
+            if data['leader_commit'] > state.commit_index:
+                state = State.from_(state,
+                        commit_index=min(data['commit_index'], len(state.log)))
+        sendto(udp_server, response.address, {
+            'type': 'append_entries_response',
+            'term': state.current_term,
+            'success': True,
+        })
+        return state
+    else:
+        raise ValueError('unknown rpc type: %s' % response['type'])
+
 def make_follower_stream(udp_server, state, timer_stream=None, rpc_stream=None):
-    timer_stream = timer_stream or make_randseq_stream(time(), 0.150, 0.300)
+    timer_stream = timer_stream or make_randseq_stream(time(), 1.50, 4.50)
     rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    logger.debug(rpc_stream.stopped and 'candidate rpc stream stopped.' or 'xxx')
     if rpc_stream.stopped: # -> candidate (timeout, start election)
         state = elect_self(udp_server, state)
     else: # -> respond append_entries & request_vote
         response = rpc_stream.head
-        state = follower_respond_rpc(response, state) # @follower
+        state = follower_respond_rpc(udp_server, response, state) # @follower
     def rest():
         return make_follower_stream(udp_server, state, timer_stream, rpc_stream)
     return Stream(state, rest, exit=rpc_stream.exit)
 
-def make_candidate_stream(udp_server, state, timer_stream=None, rpc_stream=None):
-    timer_stream = make_fixednum_stream(0.300)
-    rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    if rpc_stream.stopped: # -> restart election
-        next_state, exit = elect_self(udp_server, state), 'new_election'
-    else:
-        next_state, exit = candidate_respond_rpc(rpc_stream, state) # ->leader, ->follower
+def candidate_handle_request_vote_response(state, rpc_data, voted):
+    if rpc_data.payload['type'] == 'request_vote_response':
+        if rpc_data.payload['vote_granted']:
+            voted.add(rpc_data.address)
+        if len(voted) > (len(state.config['peers']) + 1) / 2:
+            return state, 'to_leader'
+
+def candidate_handle_append_entries(state, rpc_data):
+    if rpc_data.payload['type'] == 'append_entries':
+        if state.current_term == rpc_data.payload['term']:
+            return state, 'to_follower'
+
+def candidate_handle_request_vote(state, udp_server, rpc_data):
+    data = rpc_data.payload
+    if data['type'] == 'request_vote':
+        if grant_vote(state, udp_server, rpc_data):
+            state = State.from_(state, voted_for=data['candidate_id'])
+            return state, 'to_follower'
+
+def candidate_respond_rpc(state, udp_server):
+    voted = set()
+    start = time()
+    for rpc_data in keep_receiving(udp_server, period=0.300):
+        ret = candidate_handle_request_vote_response(state, rpc_data, voted)
+        if ret:
+            return ret
+        ret = candidate_handle_append_entries(state, rpc_data)
+        if ret:
+            return ret
+        ret = candidate_handle_request_vote(state, udp_server, rpc_data)
+        if ret:
+            return ret
+
+    return state, 'new_election'
+
+def make_candidate_stream(udp_server, state):
+    next_state = elect_self(udp_server, state)
+    next_state, exit = candidate_respond_rpc(next_state, udp_server)
     def rest():
         return make_candidate_stream(udp_server, next_state)
     return Stream(next_state, rest, exit=exit)
 
-def make_leader_stream(udp_server, state, heartbeat_stream=None,
-        timer_stream=None, rpc_stream=None):
-    heartbeat_stream = heartbeat_stream or make_fixednum_stream(0.300)
-    timer_stream = make_fixednum_stream(0.300)
-    rpc_stream = rpc_stream or make_rpc_stream(udp_server, timer_stream)
-    state = leader_respond_rpc(rpc_stream, state)
+def leader_respond_rpc(udp_server, state, period):
+    broadcast(udp_server, state.config['peers'], {
+        'type': 'append_entries',
+        'term': state.current_term,
+        'leader_id': state.config['id'],
+        'commit_index': state.commit_index,
+    })
+    for rpc_data in keep_receiving(udp_server, period=period):
+        pass
+    return state
+
+def make_leader_stream(udp_server, state, heartbeat_stream=None):
+    state = leader_respond_rpc(udp_server, state, 0.300)
     def rest():
-        return make_leader_stream(udp_server, state, heartbeat_stream, timer_stream, rpc_stream)
+        return make_leader_stream(udp_server, state, heartbeat_stream)
     return Stream(state, rest) # Can leader rule life-long? Good question.
 
 @dataclass
@@ -238,85 +331,64 @@ def get_rpc_data(udp_server, timeout):
     if timeout <= 0:
         return None
     else:
+        #logger.debug(f'try to receive from {udp_server} in {timeout} seconds.')
         udp_server.settimeout(timeout)
         try:
             datagram, address = udp_server.recvfrom(8192)
+            #logger.debug(f'{udp_server} received datagram.')
             return RpcData(json.loads(datagram.decode()), address)
         except socket.timeout:
+            #logger.debug(f'{udp_server} received nothing.')
             return None
+
+def keep_receiving(udp_server, period):
+    start = time()
+    count = 0
+    left = period
+    while left > 0:
+        count += 1
+        rpc_data = get_rpc_data(udp_server, left)
+        if rpc_data is None:
+            break
+        #logger.debug(f'{udp_server} received {count} datagrams in {period} seconds. This datagram is {rpc_data.payload}')
+        yield rpc_data
+        left -= (time() - start)
 
 def make_rpc_stream(udp_server, timeout_stream):
     rpc_data = get_rpc_data(udp_server, timeout_stream.head)
     rest = lambda: make_rpc_stream(udp_server, timer_stream.rest)
-    return Stream(rpc_data, rest)
+    return Stream(rpc_data, rest, exit=rpc_data is None)
 
-def make_consequent_rpc_stream(udp_server, period):
-    address = None
-    if timeout <= 0:
-        rpc_data = None
-    else:
-        start_epoch = time()
-        udp_server.settimeout(period)
-        try:
-            datagram, address = udp_server.recvfrom(8192)
-            period -= (time() - start_epoch)
-            rpc_data = RpcData(json.loads(datagram.decode()), address)
-        except socket.timeout:
-            rpc_data = None
-    return Stream(rpc_data,
-                  partial(make_consequent_rpc_stream, udp_server, period))
-
-def make_periodical_rpc_stream(udp_server, timeout):
-    udp_server.settimeout(timeout)
+def sendto(udp_server, target, data):
+    encode = json.dumps(data).encode()
     try:
-        datagram, address = udp_server.recvfrom(8192)
-        rpc_data = RpcData(json.loads(datagram.decode()), address)
-    except socket.timeout:
-        rpc_data = None
-    return Stream(rpc_data, partial(make_periodical_rpc_stream, udp_server, timeout))
+        if isinstance(target, str):
+            host, port = target.split(':')
+            host, port = host or '0.0.0.0', int(port)
+            udp_server.sendto(encode, (host, port))
+        else:
+            udp_server.sendto(encode, target)
+        logger.debug(f'udp server had sent {encode} to {target}.')
+    except socket.gaierror:
+        logger.debug(f'udp server failed sending {encode} to {target}.')
 
-
-def apply_server_rules(config, state, state_machine, udp_server, rpc_stream):
-    state = validate_commit_index(state_machine, state)
-    rpc_data = rpc_stream.head
-    state = validate_term(udp_server, config['peers'], rpc_data, state)
-    if state.role == 'follower':
-        state = follower_respond_rpc(udp_server, state)
-        if rpc_data is None:
-            state = State.from_(state, role='candidate')
-            state = start_election(udp_server, state)
-    elif state.role == 'candidate':
-        votes = collect_votes(rpc_stream)
-        if is_majority_accepted(votes):
-            state = State.from_(state, role='leader')
-            send_initial_heartbeat(udp_server, state)
-        elif is_append_entries_received(votes):
-            state = State.from_(state, role='follower')
-        elif is_no_votes_received(votes):
-            state = start_election(udp_server, state)
-    elif state.role == 'leader':
-        pass
-    return state
 
 def broadcast(udp_server, targets, data):
     for target in targets:
-        encode = json.dumps(data).encode()
-        host, port = target.split(':')
-        host, port = host or '0.0.0.0', int(port)
-        udp_server.sendto(encode, (host, port))
-        logger.debug(f'udp server has send {encode} to {target}.')
+        sendto(udp_server, target, data)
 
 
 def main(bind, peers):
+    now = time()
+    logger.info('server {bind} started at {now}.')
     state_stream = make_state_stream({
         'id': str(uuid4()),
         'bind': bind,
         'peers': peers,
     })
     while True:
-        state = state_stream.head
+        role, state = state_stream.head
         state_stream = state_stream.rest
-
 
 if __name__ == '__main__':
     main(sys.argv[1], sys.argv[2:])
