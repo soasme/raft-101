@@ -90,45 +90,16 @@ def make_udp_server(config):
 def log_transition(state, from_, to):
     logger.info(f'{state.config["id"]} {state.config["bind"]} convert from {from_} to {to}.')
 
-def make_state_stream(config, state=None, role=None, state_stream=None):
-    role = role or 'follower'
+def make_state_stream(config, state=None, state_stream=None):
     state = state or State(config=config, current_term=0, voted_for=None,
                            commit_index=0, last_applied=0, next_index=[], match_index=[],
                            log=[{'term': 0, 'cmd': {}}])
     state_stream = state_stream or make_follower_stream(state)
 
-    if role == 'follower' and not state_stream.stopped:
-        state_stream = state_stream.rest
-    elif role == 'follower' and state_stream.stopped:
-        log_transition(state, 'follower', 'candidate')
-        role, state_stream = 'candidate', Stream(state, lambda: make_candidate_stream(state))
-
-    elif role == 'candidate' and not state_stream.stopped:
-        state_stream = state_stream.rest
-    elif role == 'candidate' and state_stream.exit == 'new_election':
-        role, state_stream = 'candidate', make_candidate_stream(state)
-    elif role == 'candidate' and state_stream.exit == 'to_leader':
-        logger.debug('leader got state: {state}, {state_stream}')
-        role, state_stream = 'leader', make_leader_stream(udp_server, state)
-        log_transition(state, 'candidate', 'leader')
-    elif role == 'candidate' and state_stream.exit == 'to_follower':
-        role, state_stream = 'follower', make_follower_stream(state)
-        log_transition(state, 'candidate', 'follower')
-    elif role == 'candidate':
-        raise Exception('candidate stream bad condition. head=%s exit=%s', state_stream.head, state_stream.exit)
-
-    elif role == 'leader' and not state_stream.stopped:
-        state_stream = state_stream.rest
-    elif role == 'leader' and state_stream.stopped:
-        role, state_stream = 'follower', make_follower_stream(state)
-        log_transition(state, 'leader', 'follower')
-
-    state = state_stream.head
-
     def rest():
-        return make_state_stream(config, state, role, udp_server, state_stream)
+        return make_state_stream(config, state, state_stream.rest)
 
-    return Stream((role, state), rest, exit=None)
+    return Stream(state, rest)
 
 def elect_self(state):
     state = State.from_(state,
@@ -145,7 +116,7 @@ def elect_self(state):
 
 def grant_vote(state, rpc_data):
     data = rpc_data.payload
-    server = state.config['udp_server']
+    udp_server = state.config['udp_server']
     if data['term'] < state.current_term:
         vote_granted = False
         return False
@@ -206,10 +177,11 @@ def make_follower_stream(state, timer_stream=None, rpc_stream=None):
         state, role = validate_term(rpc_data, state, 'follower')
         state = follower_respond_rpc(state, rpc_data) # @follower
     def rest():
-        if rpc_stream.stoped:
+        if rpc_stream.stopped:
+            log_transition(state, 'follower', 'candidate')
             return make_candidate_stream(state)
         return make_follower_stream(state, timer_stream, rpc_stream)
-    return Stream(state, rest, exit=rpc_stream.exit)
+    return Stream(state, rest)
 
 def candidate_handle_request_vote_response(state, rpc_data, voted):
     if rpc_data.payload['type'] == 'request_vote_response':
@@ -237,7 +209,7 @@ def candidate_respond_rpc(state):
     for rpc_data in keep_receiving(udp_server, period=0.300):
         state, role = validate_term(rpc_data, state, 'candidate')
         if role == 'follower':
-            return state, role
+            return state, 'to_follower'
         ret = candidate_handle_request_vote_response(state, rpc_data, voted)
         if ret:
             return ret
@@ -256,12 +228,15 @@ def make_candidate_stream(state):
     def rest():
         assert exit in ('new_election', 'to_leader', 'to_follower')
         if exit == 'new_election':
+            log_transition(state, 'candidate', 'candidate')
             return make_candidate_stream(state)
         elif exit == 'to_leader':
+            log_transition(state, 'candidate', 'leader')
             return make_leader_stream(state)
         elif exit == 'to_follower':
+            log_transition(state, 'candidate', 'follower')
             return make_follower_stream(state)
-    return Stream(state, rest, exit=exit)
+    return Stream(state, rest)
 
 def leader_send_heartbeats(state):
     udp_server = state.config['udp_server']
@@ -289,14 +264,17 @@ def leader_respond_rpc(state, period):
         if role == 'follower':
             return state, role
         sender = rpc_data.payload['sender']
-        if not rpc_data.payload['success']:
-            next_index = dict(state.next_index)
-            next_index.setdefault(rpc_data.payload['sender'], 0)
-            next_index[rpc_data.payload['sender']] -= 1
-            state = State.from_(state, next_index=next_index)
-        else:
-            # TODO
-            pass
+        if rpc_data.payload['type'] == 'append_entries_response':
+            if not rpc_data.payload['success']:
+                next_index = dict(state.next_index)
+                next_index.setdefault(rpc_data.payload['sender'], 0)
+                next_index[rpc_data.payload['sender']] -= 1
+                state = State.from_(state, next_index=next_index)
+            for n in range(state.commit_index+1, len(state.log)):
+                cnt = len([1 for id, idx in state.commit_index.items() if idx >= n])
+                if cnt > len(state.peers) + 1 and \
+                        state.log[n]['term'] == state.current_term:
+                    state = State.from_(state, commit_index=n)
     return state, role
 
 def make_leader_stream(state):
@@ -305,6 +283,7 @@ def make_leader_stream(state):
     def rest():
         assert role in ('follower', 'leader')
         if role == 'follower':
+            log_transition(state, 'leader', 'follower')
             return make_follower_stream(state)
         return make_leader_stream(state)
     return Stream(state, rest) # Can leader rule life-long? Good question.
@@ -353,7 +332,7 @@ def validate_commit_index(state_machine, state):
 # * reject the other leader (by sending a response with `success=false`)
 def validate_term(rpc_data, state, role):
     data = rpc_data.payload
-    if data['term'] > state.term:
+    if data['term'] > state.current_term:
         state, role = State.from_(
             state,
             current_term=data['term'],
@@ -431,7 +410,7 @@ def main(bind, peers):
     })
     state_stream = make_state_stream(config)
     while True:
-        role, state = state_stream.head
+        state = state_stream.head
         state_stream = state_stream.rest
 
 if __name__ == '__main__':
