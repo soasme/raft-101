@@ -8,7 +8,7 @@ from random import uniform
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 class Stream(object):
     def __init__(self, head, rest_fn, exit=None):
@@ -55,6 +55,7 @@ def reduce_stream(fn, s, init):
     elem = init
     while not s.stopped:
         elem = fn(elem, s.head)
+        s = s.rest
     return elem
 
 def randseq(minimum, maximum):
@@ -68,7 +69,7 @@ def fixednum(num):
 def stopwatch(period, start=None):
     start = start or time()
     head = max(0, period - (time() - start))
-    rest = lambda: countdown(period, start)
+    rest = lambda: stopwatch(period, start)
     return Stream(head, rest, exit=not head)
 
 def make_udp_server(bind):
@@ -88,7 +89,6 @@ def sendto(udp_server, target, data):
             host, port = host or '0.0.0.0', int(port)
         else:
             host, port = target
-        logger.info(f'error: {target}')
         udp_server.sendto(encode, (host, port))
         logger.debug(f'udp server had sent {encode} to {target}.')
     except socket.gaierror:
@@ -114,7 +114,7 @@ def receive(udp_server, timeout):
 def keep_receiving(udp_server, second, left=None):
     left = left or stopwatch(second)
     data = receive(udp_server, left.head) if not left.stopped else None
-    rest = lambda: keep_receiving(udp_server, second, left)
+    rest = lambda: keep_receiving(udp_server, second, left.rest)
     return Stream(data, rest, exit=data is None)
 
 @dataclass
@@ -150,7 +150,7 @@ def validate_term(f):
         if datagram.payload['term'] > state.current_term:
             state = state.to(
                 current_term=datagram.payload['term'],
-                ctx=dict(ctx, server_state='follower'),
+                ctx=dict(state.ctx, server_state='follower'),
             )
         return state
     return _
@@ -161,7 +161,7 @@ def validate_commit_index(f):
         if state.commit_index > state.last_applied:
             state = state.to(
                 last_applied=state.commit_index,
-                ctx=dict(ctx, state_machine=apply_state_machine(state))
+                ctx=dict(state.ctx, state_machine=apply_state_machine(state))
             )
         return state
     return _
@@ -191,7 +191,7 @@ def init_raft_state(ctx):
     )
 
 def make_follower_stream(state):
-    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(0.5, 1.0))
+    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(1.5, 4.5))
     election_timeout = datagram_stream.stopped
     state = reduce_stream(follower_handle_datagram, datagram_stream, state)
     rest = lambda: make_candidate_stream(state) if election_timeout \
@@ -200,7 +200,7 @@ def make_follower_stream(state):
 
 def make_candidate_stream(state):
     state = elect_self(state)
-    datagram_stream = keep_receiving(state.ctx['udp_server'], 0.4)
+    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(1.5, 4.5))
     election_timeout = datagram_stream.stopped
     state = reduce_stream(candidate_handle_datagram, datagram_stream, state)
     def rest():
@@ -214,7 +214,7 @@ def make_candidate_stream(state):
 
 def make_leader_stream(state):
     state = send_heartbeat(state)
-    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(0.15, 0.3))
+    datagram_stream = keep_receiving(state.ctx['udp_server'], 0.3)
     state = reduce_stream(leader_handle_datagram, datagram_stream, state)
     rest = lambda: make_follower_stream(initialize_follower(state)) \
             if state.ctx['server_state'] == 'follower' else make_leader_stream(state)
@@ -293,17 +293,20 @@ def on_receiving_append_entries(state, datagram):
     return state
 
 def elect_self(state):
-    return state.to(
+    state = state.to(
         current_term=state.current_term+1,
         voted_for=state.ctx['bind'],
-        ctx=dict(state.ctx, votes=0),
+        ctx=dict(state.ctx, votes=0, server_state='candidate'),
     )
+    request_vote(state)
+    return state
 
 @validate_term
 @validate_commit_index
 def follower_handle_datagram(state, datagram):
     if datagram.payload['type'] == 'request_vote':
-        return on_receiving_request_vote(state, datagram)
+        state = on_receiving_request_vote(state, datagram)
+        return state
     elif datagram.payload['type'] == 'append_entries':
         return on_receiving_append_entries(state, datagram)
     else:
@@ -382,13 +385,8 @@ if __name__ == '__main__':
     bind, peers = sys.argv[1], sys.argv[2:]
     state = init_raft_state({'bind': bind, 'peers': peers})
     logger.info(f'server started at {state.ctx["bind"]}')
-    if '8081' in bind or '8082' in bind:
-        stream = make_raft_server(state)
-        while not stream.stopped:
-            print(stream.head)
-            stream = stream.rest
-    else:
-        stream = make_leader_stream(state)
-        while not stream.stopped:
-            print(stream.head)
-            stream = stream.rest
+    stream = make_raft_server(state)
+    while not stream.stopped:
+        state = stream.head
+        logger.info('%s %s', time(), state.ctx['server_state'])
+        stream = stream.rest
