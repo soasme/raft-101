@@ -168,7 +168,8 @@ def validate_commit_index(f):
     return _
 
 # TODO
-def apply_state_machine(state): return {}
+def apply_state_machine(state):
+    return {}
 
 def make_raft_server(state=None, state_stream=None):
     stream = state_stream or make_follower_stream(state)
@@ -226,7 +227,7 @@ def append_entries(state):
     for peer in state.ctx['peers']:
         prev_log_index = (state.next_index.get(peer) or 0)
         prev_log_term = state.log[prev_log_index]['term']
-        entries = state.log[prev_log_index:]
+        entries = state.log[prev_log_index+1:]
         broadcast(udp_server, state.ctx['peers'], {
             'type': 'append_entries',
             'term': state.current_term,
@@ -392,5 +393,4 @@ if __name__ == '__main__':
     stream = make_raft_server(state)
     while not stream.stopped:
         state = stream.head
-        logger.info('%s %s', time(), state.ctx['server_state'])
         stream = stream.rest
