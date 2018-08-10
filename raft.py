@@ -300,7 +300,7 @@ def elect_self(state):
     state = state.to(
         current_term=state.current_term+1,
         voted_for=state.ctx['bind'],
-        ctx=dict(state.ctx, votes=0, server_state='candidate'),
+        ctx=dict(state.ctx, votes=1, server_state='candidate'),
     )
     request_vote(state)
     return state
@@ -346,7 +346,7 @@ def leader_handle_datagram(state, datagram):
 
 def candidate_handle_request_vote_response(state, datagram):
     data = datagram.payload
-    if data['term'] == state.current_term:
+    if data['term'] == state.current_term and data['vote_granted']:
         state = state.to(ctx=dict(state.ctx, votes=state.ctx['votes'] + 1))
     if state.ctx['votes'] > (len(state.ctx['peers']) + 1 ) / 2:
         state = state.to(ctx=dict(state.ctx, server_state='leader'))
@@ -360,8 +360,8 @@ def initialize_follower(state):
 def initialize_leader(state):
     return state.to(
         ctx=dict(state.ctx, server_state='leader'),
-        next_index={peer: len(state.log) for peer in peers},
-        match_index={peer: 0 for peer in peers},
+        next_index={peer: len(state.log)-1 for peer in state.ctx['peers']},
+        match_index={peer: 0 for peer in state.ctx['peers']},
     )
 
 def send_heartbeat(state):

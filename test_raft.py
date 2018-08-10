@@ -85,8 +85,23 @@ class TestRaft(unittest.TestCase):
         ])):
             stream = make_raft_server(self.init_state)
             assert stream.head.ctx['server_state'] == 'follower'
-            assert stream.rest.head.ctx['server_state'] == 'candidate'
+            assert stream.rest.head.ctx['server_state'] == 'leader'
             assert stream.rest.rest.head.ctx['server_state'] == 'leader'
+
+    def test_candidate_does_not_receive_majority_votes(self):
+        with patch('raft.keep_receiving', side_effect=mock_keep_receiving([
+            None,
+            Datagram('0.0.0.0:8001', {
+                'type': 'request_vote_response',
+                'term': 1,
+                'vote_granted': False,
+            })
+        ])):
+            stream = make_raft_server(self.init_state)
+            assert stream.head.ctx['server_state'] == 'follower'
+            print(stream.rest.head)
+            assert stream.rest.head.ctx['server_state'] == 'candidate'
+            assert stream.rest.rest.head.ctx['server_state'] == 'follower'
 
 
 if __name__ == '__main__':
