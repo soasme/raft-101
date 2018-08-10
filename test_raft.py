@@ -102,6 +102,19 @@ class TestRaft(unittest.TestCase):
             assert stream.rest.head.ctx['server_state'] == 'candidate'
             assert stream.rest.rest.head.ctx['server_state'] == 'follower'
 
+    def test_on_next_callback(self):
+        with patch('raft.keep_receiving', side_effect=mock_keep_receiving([])):
+            n = 1
+            def on_next(state):
+                nonlocal n
+                n += 1
+                return state
+            state = self.init_state.to(ctx=dict(self.init_state.ctx, on_next=on_next))
+            stream = make_raft_server(state)
+            assert stream.head.ctx['server_state'] == 'follower'
+            assert n == 2
+            assert stream.rest.head.ctx['server_state'] == 'candidate'
+            assert n == 3
 
 
 if __name__ == '__main__':

@@ -8,7 +8,6 @@ from random import uniform
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 class Stream(object):
     def __init__(self, head, rest_fn, exit=None):
@@ -35,36 +34,12 @@ class Stream(object):
             return '<Stream stopped>'
         return 'Stream({0}, <rest_fn>)'.format(repr(self.head))
 
-def map_stream(fn, s):
-    if s.stopped:
-        return s
-    def rest_fn():
-        return map_stream(fn, s.rest)
-    return Stream(fn(s.head), rest_fn)
-
-def filter_stream(fn, s):
-    if s.stopped:
-        return s
-    def rest_fn():
-        return filter_stream(fn, s.rest)
-    if fn(s.head):
-        return Stream(s.head, rest_fn)
-    return rest_fn()
-
 def reduce_stream(fn, s, init):
     elem = init
     while not s.stopped:
         elem = fn(elem, s.head)
         s = s.rest
     return elem
-
-def randseq(minimum, maximum):
-    rand = uniform(minimum, maximum)
-    rest = lambda: randseq(minimum, maximum)
-    return Stream(rand, rest)
-
-def fixednum(num):
-    return Stream(num, lambda: fixednum(num))
 
 def stopwatch(period, start=None):
     start = start or time()
@@ -90,7 +65,6 @@ def sendto(udp_server, target, data):
         else:
             host, port = target
         udp_server.sendto(encode, (host, port))
-        logger.debug(f'udp server had sent {encode} to {target}.')
     except socket.gaierror:
         logger.debug(f'udp server failed sending {encode} to {target}.')
 
@@ -167,14 +141,16 @@ def validate_commit_index(f):
         return f(state, datagram)
     return _
 
-# TODO
 def apply_state_machine(state):
-    return {}
+    for not_applied in range(state.last_applied + 1, state.commit_index + 1):
+        state.ctx['state_machine'].update(state.log[not_applied]['cmd'])
+    return state.ctx['state_machine']
 
 def make_raft_server(state=None, state_stream=None):
     stream = state_stream or make_follower_stream(state)
+    state = stream.head
     rest = lambda: make_raft_server(state, stream.rest)
-    return Stream(stream.head, rest)
+    return Stream(state, rest)
 
 def init_raft_state(ctx):
     ctx['start_epoch'] = ctx.get('start_epoch') or time()
@@ -196,8 +172,13 @@ def make_follower_stream(state):
     datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(1.5, 4.5))
     election_timeout = datagram_stream.stopped
     state = reduce_stream(follower_handle_datagram, datagram_stream, state)
-    rest = lambda: make_candidate_stream(state) if election_timeout \
-            else make_follower_stream(state)
+    def rest():
+        next_state = state.ctx.get('on_next', lambda n:n)(state)
+        if election_timeout:
+            logger.debug('convert to candidate.')
+            return make_candidate_stream(next_state)
+        else:
+            return make_follower_stream(next_state)
     return Stream(state, rest)
 
 def make_candidate_stream(state):
@@ -206,20 +187,29 @@ def make_candidate_stream(state):
     election_timeout = datagram_stream.stopped
     state = reduce_stream(candidate_handle_datagram, datagram_stream, state)
     def rest():
+        next_state = state.ctx.get('on_next', lambda n:n)(state)
         if election_timeout:
-            return make_candidate_stream(state)
-        elif state.ctx['server_state'] == 'follower':
-            return make_follower_stream(initialize_follower(state))
-        elif state.ctx['server_state'] == 'leader':
-            return make_leader_stream(initialize_leader(state))
+            return make_candidate_stream(next_state)
+        elif next_state.ctx['server_state'] == 'follower':
+            logger.debug('convert to follower.')
+            return make_follower_stream(initialize_follower(next_state))
+        elif next_state.ctx['server_state'] == 'leader':
+            logger.debug('convert to leader.')
+            return make_leader_stream(initialize_leader(next_state))
     return Stream(state, rest)
 
 def make_leader_stream(state):
     state = send_heartbeat(state)
     datagram_stream = keep_receiving(state.ctx['udp_server'], 0.3)
     state = reduce_stream(leader_handle_datagram, datagram_stream, state)
-    rest = lambda: make_follower_stream(initialize_follower(state)) \
-            if state.ctx['server_state'] == 'follower' else make_leader_stream(state)
+    logger.info(f'leader state: {state}')
+    def rest():
+        next_state = state.ctx.get('on_next', lambda n:n)(state)
+        if next_state.ctx['server_state'] == 'follower':
+            logger.debug('convert to follower')
+            return make_follower_stream(initialize_follower(next_state))
+        else:
+            return make_leader_stream(next_state)
     return Stream(state, rest)
 
 def append_entries(state):
@@ -251,7 +241,9 @@ def reply_append_entries(state, datagram, success):
     sendto(state.ctx['udp_server'], datagram.address, {
         'type': 'append_entries_response',
         'term': state.current_term,
-        'success': bool(success)
+        'success': bool(success),
+        'last_log_index': len(state.log) - 1,
+        'last_log_term': state.log[-1]['term'],
     })
 
 def reply_request_vote(state, datagram, vote_granted):
@@ -279,6 +271,7 @@ def on_receiving_request_vote(state, datagram):
 
 def on_receiving_append_entries(state, datagram):
     data = datagram.payload
+    logger.debug(f'nonleader term={state.current_term} is handling {data}')
     if data['term'] < state.current_term \
             or data['prev_log_index'] > len(state.log) - 1:
         reply_append_entries(state, datagram, success=False)
@@ -361,7 +354,7 @@ def initialize_follower(state):
 def initialize_leader(state):
     return state.to(
         ctx=dict(state.ctx, server_state='leader'),
-        next_index={peer: len(state.log)-1 for peer in state.ctx['peers']},
+        next_index={peer: len(state.log) for peer in state.ctx['peers']},
         match_index={peer: 0 for peer in state.ctx['peers']},
     )
 
@@ -371,24 +364,40 @@ def send_heartbeat(state):
 
 def leader_handle_append_entries_response(state, datagram):
     data = datagram.payload
+    host, port = datagram.address
+    hostname = socket.gethostbyname(host) # TODO
+    sender = f'{hostname}:{port}'
+    logger.debug(f'leader is handling {data}.')
     if not data['success']:
         next_index = dict(state.next_index)
-        host, port = datagram.address
-        hostname = socket.gethostname(host) # TODO
-        sender = f'{hostname}:{port}'
         next_index.setdefault(sender, 1)
         next_index[sender] = max(0, next_index[sender]-1)
         state = state.to(next_index=next_index)
+    else:
+        next_index = dict(state.next_index)
+        next_index[sender] = data['last_log_index']
+        match_index = dict(state.match_index)
+        match_index[sender] = data['last_log_index']
+        state = state.to(next_index=next_index, match_index=match_index)
     for n in range(state.commit_index+1, len(state.log)):
-        cnt = len(id for id, idx in state.match_index.items() if idx >= n)
-        if cnt > len(state.peers) + 1 and \
+        cnt = len([id for id, idx in state.match_index.items() if idx >= n])
+        if cnt > len(state.ctx['peers']) + 1 and \
                 state.log[n]['term'] == state.current_term:
             state = state.to(commit_index=n)
     return state
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
     bind, peers = sys.argv[1], sys.argv[2:]
-    state = init_raft_state({'bind': bind, 'peers': peers})
+
+    def on_next(state):
+        if state.ctx['server_state'] == 'leader':
+            state = state.to(
+                log=state.log+[{'term': state.current_term, 'cmd': {'demo': time()}}]
+            )
+        return state
+
+    state = init_raft_state({'bind': bind, 'peers': peers, 'on_next': on_next})
     logger.info(f'server started at {state.ctx["bind"]}')
     stream = make_raft_server(state)
     while not stream.stopped:
