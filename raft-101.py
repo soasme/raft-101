@@ -1,8 +1,8 @@
+import json
 import sys
 import socket
 import logging
 from functools import wraps
-from uuid import uuid4
 from time import sleep, time
 from random import uniform
 from dataclasses import dataclass
@@ -88,6 +88,7 @@ def sendto(udp_server, target, data):
             host, port = host or '0.0.0.0', int(port)
         else:
             host, port = target
+        logger.info(f'error: {target}')
         udp_server.sendto(encode, (host, port))
         logger.debug(f'udp server had sent {encode} to {target}.')
     except socket.gaierror:
@@ -132,7 +133,7 @@ class State:
     match_index: list
 
     def to(self, **kwargs):
-        return cls(
+        return State(
             ctx=kwargs.get('ctx') or self.ctx,
             current_term=kwargs.get('current_term') or self.current_term,
             voted_for=kwargs.get('voted_for') or self.voted_for,
@@ -174,7 +175,6 @@ def make_raft_server(state=None, state_stream=None):
     return Stream(stream.head, rest)
 
 def init_raft_state(ctx):
-    ctx['id'] = str(uuid4())
     ctx['start_epoch'] = time()
     ctx['udp_server'] = make_udp_server(ctx['bind'])
     ctx['server_state'] = 'follower'
@@ -185,13 +185,13 @@ def init_raft_state(ctx):
         voted_for=None,
         commit_index=0,
         last_applied=0,
-        next_index=[],
-        match_index=[],
+        next_index={},
+        match_index={},
         log=[{'term': 0, 'cmd': {}}]
     )
 
 def make_follower_stream(state):
-    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(1.5, 3.0))
+    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(0.5, 1.0))
     election_timeout = datagram_stream.stopped
     state = reduce_stream(follower_handle_datagram, datagram_stream, state)
     rest = lambda: make_candidate_stream(state) if election_timeout \
@@ -199,21 +199,37 @@ def make_follower_stream(state):
     return Stream(state, rest)
 
 def make_candidate_stream(state):
-    return fixednum(3)
+    state = elect_self(state)
+    datagram_stream = keep_receiving(state.ctx['udp_server'], 0.4)
+    election_timeout = datagram_stream.stopped
+    state = reduce_stream(candidate_handle_datagram, datagram_stream, state)
+    def rest():
+        if election_timeout:
+            return make_candidate_stream(state)
+        elif state.ctx['server_state'] == 'follower':
+            return make_follower_stream(initialize_follower(state))
+        elif state.ctx['server_state'] == 'leader':
+            return make_leader_stream(initialize_leader(state))
+    return Stream(state, rest)
 
 def make_leader_stream(state):
-    return fixednum(3)
+    state = send_heartbeat(state)
+    datagram_stream = keep_receiving(state.ctx['udp_server'], uniform(0.15, 0.3))
+    state = reduce_stream(leader_handle_datagram, datagram_stream, state)
+    rest = lambda: make_follower_stream(initialize_follower(state)) \
+            if state.ctx['server_state'] == 'follower' else make_leader_stream(state)
+    return Stream(state, rest)
 
 def append_entries(state):
     udp_server = state.ctx['udp_server']
     for peer in state.ctx['peers']:
-        prev_log_index = (state.next_index.get(sender) or 0)
+        prev_log_index = (state.next_index.get(peer) or 0)
         prev_log_term = state.log[prev_log_index]['term']
         entries = state.log[prev_log_index:]
-        sendto(udp_server, rpc_data.address, {
+        broadcast(udp_server, state.ctx['peers'], {
             'type': 'append_entries',
             'term': state.current_term,
-            'leader_id': state.config['id'],
+            'leader_id': state.ctx['bind'],
             'prev_log_index': prev_log_index,
             'prev_log_term': prev_log_term,
             'leader_commit': state.commit_index,
@@ -224,7 +240,7 @@ def request_vote(state):
     broadcast(state.ctx['udp_server'], state.ctx['peers'], {
         'type': 'request_vote',
         'term': state.current_term,
-        'candidate_id': state.ctx['id'],
+        'candidate_id': state.ctx['bind'],
         'last_log_index': len(state.log) - 1,
         'last_log_term': state.log[-1]['term'],
     })
@@ -243,18 +259,20 @@ def reply_request_vote(state, datagram, vote_granted):
         'vote_granted': bool(vote_granted)
     })
 
-@validate_term
-@validate_commit_index
-def follower_handle_datagram(state, datagram):
-    if datagram.payload['type'] == 'request_vote':
-        return follower_on_append_entries(state, datagram)
-    elif datagram.payload['type'] == 'append_entries':
-        return follower_on_request_vote(state, datagram)
-    else:
+def on_receiving_request_vote(state, datagram):
+    data = datagram.payload
+    if data['term'] < state.current_term:
+        reply_request_vote(state, datagram, vote_granted=False)
         return state
+    if state.voted_for in (None, data['candidate_id']) \
+            and data['last_log_index'] >= len(state.log) - 1:
+        reply_request_vote(state, datagram, vote_granted=True)
+        state = state.to(ctx=dict(state.ctx, server_state='follower'))
+    else:
+        reply_request_vote(state, datagram, vote_granted=False)
+    return state
 
-
-def follower_on_append_entries(state, datagram):
+def on_receiving_append_entries(state, datagram):
     data = datagram.payload
     if data['term'] < state.current_term \
             or data['prev_log_index'] > len(state.log) - 1:
@@ -264,31 +282,113 @@ def follower_on_append_entries(state, datagram):
     if state.log[data['prev_log_index']]['term'] != data['term']:
         state = state.to(log=state.log[:data['prev_log_index']])
 
-    state = state.to(log=state.log + data['entries'])
+    state = state.to(
+        log=state.log + data['entries'],
+        ctx=dict(state.ctx, server_state='follower'),
+    )
 
     if data['leader_commit'] > state.commit_index:
         state = state.to(commit_index=min(data['leader_commit'], len(state.log) - 1))
     reply_append_entries(state, datagram, success=True)
     return state
 
-def follower_on_request_vote(state, datagram):
-    data = datagram.payload
-    if data['term'] < state.current_term:
-        reply_request_vote(state, datagram, vote_granted=False)
-        return state
-    if state.voted_for in (None, data['candidate_id']) \
-            and data['last_log_index'] >= len(state.log) - 1:
-        reply_request_vote(state, datagram, vote_granted=True)
+def elect_self(state):
+    return state.to(
+        current_term=state.current_term+1,
+        voted_for=state.ctx['bind'],
+        ctx=dict(state.ctx, votes=0),
+    )
+
+@validate_term
+@validate_commit_index
+def follower_handle_datagram(state, datagram):
+    if datagram.payload['type'] == 'request_vote':
+        return on_receiving_request_vote(state, datagram)
+    elif datagram.payload['type'] == 'append_entries':
+        return on_receiving_append_entries(state, datagram)
     else:
-        reply_request_vote(state, datagram, vote_granted=False)
+        return state
+
+@validate_term
+@validate_commit_index
+def candidate_handle_datagram(state, datagram):
+    if state.ctx['server_state'] != 'candidate':
+        return state
+    elif datagram.payload['type'] == 'request_vote':
+        return on_receiving_request_vote(state, datagram)
+    elif datagram.payload['type'] == 'append_entries':
+        return on_receiving_append_entries(state, datagram)
+    elif datagram.payload['type'] == 'request_vote_response':
+        return candidate_handle_request_vote_response(state, datagram)
+    else:
+        return state
+
+@validate_term
+@validate_commit_index
+def leader_handle_datagram(state, datagram):
+    if state.ctx['server_state'] != 'leader':
+        return state
+    elif datagram.payload['type'] == 'append_entries':
+        return on_receiving_append_entries(state, datagram)
+    elif datagram.payload['type'] == 'request_vote':
+        return on_receiving_request_vote(state, datagram)
+    elif datagram.payload['type'] == 'append_entries_response':
+        return leader_handle_append_entries_response(state, datagram)
+    else: # TODO: apply command for clients.
+        return state
+
+def candidate_handle_request_vote_response(state, datagram):
+    data = datagram.payload
+    if data['term'] == state.current_term:
+        state = state.to(ctx=dict(state.ctx, votes=state.ctx['votes'] + 1))
+    if state.ctx['votes'] > (state.ctx['peers'] + 1 ) / 2:
+        state = state.to(ctx=dict(state.ctx, server_state='leader'))
     return state
 
+def initialize_follower(state):
+    return state.to(
+        voted_for=None,
+    )
+
+def initialize_leader(state):
+    return state.to(
+        ctx=dict(state.ctx, server_state='leader'),
+        next_index={peer: len(state.log) for peer in peers},
+        match_index={peer: 0 for peer in peers},
+    )
+
+def send_heartbeat(state):
+    append_entries(state)
+    return state
+
+def leader_handle_append_entries_response(state, datagram):
+    data = datagram.payload
+    if not data['success']:
+        next_index = dict(state.next_index)
+        host, port = datagram.address
+        hostname = socket.gethostname(host) # TODO
+        sender = f'{hostname}:{port}'
+        next_index.setdefault(sender, 1)
+        next_index[sender] = max(0, next_index[sender]-1)
+        state = state.to(next_index=next_index)
+    for n in range(state.commit_index+1, len(state.log)):
+        cnt = len(id for id, idx in state.match_index.items() if idx >= n)
+        if cnt > len(state.peers) + 1 and \
+                state.log[n]['term'] == state.current_term:
+            state = state.to(commit_index=n)
+    return state
 
 if __name__ == '__main__':
     bind, peers = sys.argv[1], sys.argv[2:]
     state = init_raft_state({'bind': bind, 'peers': peers})
     logger.info(f'server started at {state.ctx["bind"]}')
-    stream = make_raft_server(state)
-    while not stream.stopped:
-        print(stream.head)
-        stream = stream.rest
+    if '8081' in bind or '8082' in bind:
+        stream = make_raft_server(state)
+        while not stream.stopped:
+            print(stream.head)
+            stream = stream.rest
+    else:
+        stream = make_leader_stream(state)
+        while not stream.stopped:
+            print(stream.head)
+            stream = stream.rest
