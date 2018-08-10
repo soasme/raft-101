@@ -1,5 +1,7 @@
+import sys
 import socket
 import logging
+from functools import wraps
 from uuid import uuid4
 from time import sleep, time
 from random import uniform
@@ -141,6 +143,31 @@ class State:
             match_index=kwargs.get('match_index') or self.match_index,
         )
 
+def validate_term(f):
+    @wraps(f)
+    def _(state, datagram):
+        if datagram.payload['term'] > state.current_term:
+            state = state.to(
+                current_term=datagram.payload['term'],
+                ctx=dict(ctx, server_state='follower'),
+            )
+        return state
+    return _
+
+def validate_commit_index(f):
+    @wraps(f)
+    def _(state, datagram):
+        if state.commit_index > state.last_applied:
+            state = state.to(
+                last_applied=state.commit_index,
+                ctx=dict(ctx, state_machine=apply_state_machine(state))
+            )
+        return state
+    return _
+
+# TODO
+def apply_state_machine(state): return {}
+
 def make_raft_server(state=None, state_stream=None):
     stream = state_stream or make_follower_stream(state)
     rest = lambda: make_raft_server(state, stream.rest)
@@ -151,6 +178,7 @@ def init_raft_state(ctx):
     ctx['start_epoch'] = time()
     ctx['udp_server'] = make_udp_server(ctx['bind'])
     ctx['server_state'] = 'follower'
+    ctx['state_machine'] = {}
     return State(
         ctx=ctx,
         current_term=0,
@@ -201,26 +229,66 @@ def request_vote(state):
         'last_log_term': state.log[-1]['term'],
     })
 
+def reply_append_entries(state, datagram, success):
+    sendto(state.ctx['udp_server'], datagram.address, {
+        'type': 'append_entries_response',
+        'term': state.current_term,
+        'success': bool(success)
+    })
+
+def reply_request_vote(state, datagram, vote_granted):
+    sendto(state.ctx['udp_server'], datagram.address, {
+        'type': 'request_vote_response',
+        'term': state.current_term,
+        'vote_granted': bool(vote_granted)
+    })
+
+@validate_term
+@validate_commit_index
 def follower_handle_datagram(state, datagram):
-    assert datagram.payload['type'] in ('request_vote', 'append_entries')
     if datagram.payload['type'] == 'request_vote':
         return follower_on_append_entries(state, datagram)
     elif datagram.payload['type'] == 'append_entries':
         return follower_on_request_vote(state, datagram)
+    else:
+        return state
+
 
 def follower_on_append_entries(state, datagram):
+    data = datagram.payload
+    if data['term'] < state.current_term \
+            or data['prev_log_index'] > len(state.log) - 1:
+        reply_append_entries(state, datagram, success=False)
+        return state
+
+    if state.log[data['prev_log_index']]['term'] != data['term']:
+        state = state.to(log=state.log[:data['prev_log_index']])
+
+    state = state.to(log=state.log + data['entries'])
+
+    if data['leader_commit'] > state.commit_index:
+        state = state.to(commit_index=min(data['leader_commit'], len(state.log) - 1))
+    reply_append_entries(state, datagram, success=True)
     return state
 
 def follower_on_request_vote(state, datagram):
+    data = datagram.payload
+    if data['term'] < state.current_term:
+        reply_request_vote(state, datagram, vote_granted=False)
+        return state
+    if state.voted_for in (None, data['candidate_id']) \
+            and data['last_log_index'] >= len(state.log) - 1:
+        reply_request_vote(state, datagram, vote_granted=True)
+    else:
+        reply_request_vote(state, datagram, vote_granted=False)
     return state
 
+
 if __name__ == '__main__':
-    from time import time, sleep
-    #stream = stopwatch(3, time())
-    #stream = randseq(0.150, 0.300)
-    state = init_raft_state({'bind': ':8080'})
+    bind, peers = sys.argv[1], sys.argv[2:]
+    state = init_raft_state({'bind': bind, 'peers': peers})
+    logger.info(f'server started at {state.ctx["bind"]}')
     stream = make_raft_server(state)
     while not stream.stopped:
         print(stream.head)
-        sleep(1)
         stream = stream.rest

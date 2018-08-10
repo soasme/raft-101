@@ -54,11 +54,23 @@ def filter_stream(fn, s):
         return Stream(s.head, rest_fn)
     return rest_fn()
 
+def streamify(f):
+    return Stream(f(), f)
+
+def randseq(minimum, maximum):
+    return streamify(lambda: uniform(minimum, maximum))
+
+def fixednum(num):
+    return streamify(lambda: num)
+
+def countdown(period, start):
+    return streamify(lambda: max(0, period - (time() - start)))
+
 # follower and candidate needs it to gather votes or append_entries.
 # randseq stream never stop.
-def make_randseq_stream(seed_number, minimum, maximum):
+def make_randseq_stream(minimum, maximum):
     head = uniform(minimum, maximum)
-    rest = lambda: make_randseq_stream(head, minimum, maximum)
+    rest = lambda: make_randseq_stream(minimum, maximum)
     return Stream(head, rest)
 
 # leader needs this to send periodical broadcast.
