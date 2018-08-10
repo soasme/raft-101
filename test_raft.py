@@ -99,9 +99,9 @@ class TestRaft(unittest.TestCase):
         ])):
             stream = make_raft_server(self.init_state)
             assert stream.head.ctx['server_state'] == 'follower'
-            print(stream.rest.head)
             assert stream.rest.head.ctx['server_state'] == 'candidate'
             assert stream.rest.rest.head.ctx['server_state'] == 'follower'
+
 
 
 if __name__ == '__main__':
