@@ -202,7 +202,6 @@ def make_leader_stream(state):
     state = send_heartbeat(state)
     datagram_stream = keep_receiving(state.ctx['udp_server'], 0.3)
     state = reduce_stream(leader_handle_datagram, datagram_stream, state)
-    logger.info(f'leader state: {state}')
     def rest():
         next_state = state.ctx.get('on_next', lambda n:n)(state)
         if next_state.ctx['server_state'] == 'follower':
@@ -215,9 +214,14 @@ def make_leader_stream(state):
 def append_entries(state):
     udp_server = state.ctx['udp_server']
     for peer in state.ctx['peers']:
-        prev_log_index = (state.next_index.get(peer) or 0)
-        prev_log_term = state.log[prev_log_index]['term']
-        entries = state.log[prev_log_index+1:]
+        next_index = state.next_index[peer]
+        prev_log_index = next_index - 1
+        if prev_log_index < len(state.log):
+            prev_log_term = state.log[prev_log_index]['term']
+            entries = [state.log[prev_log_index]]
+        else:
+            prev_log_term = 0
+            entries = []
         broadcast(udp_server, state.ctx['peers'], {
             'type': 'append_entries',
             'term': state.current_term,
@@ -242,6 +246,7 @@ def reply_append_entries(state, datagram, success):
         'type': 'append_entries_response',
         'term': state.current_term,
         'success': bool(success),
+        'sender': state.ctx['bind'],
         'last_log_index': len(state.log) - 1,
         'last_log_term': state.log[-1]['term'],
     })
@@ -250,7 +255,8 @@ def reply_request_vote(state, datagram, vote_granted):
     sendto(state.ctx['udp_server'], datagram.address, {
         'type': 'request_vote_response',
         'term': state.current_term,
-        'vote_granted': bool(vote_granted)
+        'vote_granted': bool(vote_granted),
+        'sender': state.ctx['bind'],
     })
 
 def on_receiving_request_vote(state, datagram):
@@ -271,7 +277,6 @@ def on_receiving_request_vote(state, datagram):
 
 def on_receiving_append_entries(state, datagram):
     data = datagram.payload
-    logger.debug(f'nonleader term={state.current_term} is handling {data}')
     if data['term'] < state.current_term \
             or data['prev_log_index'] > len(state.log) - 1:
         reply_append_entries(state, datagram, success=False)
@@ -354,7 +359,7 @@ def initialize_follower(state):
 def initialize_leader(state):
     return state.to(
         ctx=dict(state.ctx, server_state='leader'),
-        next_index={peer: len(state.log) for peer in state.ctx['peers']},
+        next_index={peer: 1 for peer in state.ctx['peers']},
         match_index={peer: 0 for peer in state.ctx['peers']},
     )
 
@@ -364,10 +369,7 @@ def send_heartbeat(state):
 
 def leader_handle_append_entries_response(state, datagram):
     data = datagram.payload
-    host, port = datagram.address
-    hostname = socket.gethostbyname(host) # TODO
-    sender = f'{hostname}:{port}'
-    logger.debug(f'leader is handling {data}.')
+    sender = data['sender']
     if not data['success']:
         next_index = dict(state.next_index)
         next_index.setdefault(sender, 1)
@@ -375,15 +377,15 @@ def leader_handle_append_entries_response(state, datagram):
         state = state.to(next_index=next_index)
     else:
         next_index = dict(state.next_index)
-        next_index[sender] = data['last_log_index']
+        next_index[sender] = data['last_log_index'] + 1
         match_index = dict(state.match_index)
         match_index[sender] = data['last_log_index']
         state = state.to(next_index=next_index, match_index=match_index)
-    for n in range(state.commit_index+1, len(state.log)):
-        cnt = len([id for id, idx in state.match_index.items() if idx >= n])
-        if cnt > len(state.ctx['peers']) + 1 and \
-                state.log[n]['term'] == state.current_term:
-            state = state.to(commit_index=n)
+        for n in range(state.commit_index+1, len(state.log)):
+            cnt = len([id for id, idx in state.match_index.items() if idx >= n])
+            if cnt > (len(state.ctx['peers']) + 1) / 2 and \
+                    state.log[n]['term'] == state.current_term:
+                state = state.to(commit_index=n)
     return state
 
 if __name__ == '__main__':
@@ -395,6 +397,7 @@ if __name__ == '__main__':
             state = state.to(
                 log=state.log+[{'term': state.current_term, 'cmd': {'demo': time()}}]
             )
+        logger.debug(f"{state.ctx['server_state']} state_machine: {state.ctx['state_machine']}")
         return state
 
     state = init_raft_state({'bind': bind, 'peers': peers, 'on_next': on_next})
