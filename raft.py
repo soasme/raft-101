@@ -173,12 +173,11 @@ def make_follower_stream(state):
     election_timeout = datagram_stream.stopped
     state = reduce_stream(follower_handle_datagram, datagram_stream, state)
     def rest():
-        next_state = state.ctx.get('on_next', lambda n:n)(state)
         if election_timeout:
             logger.debug('convert to candidate.')
-            return make_candidate_stream(next_state)
+            return make_candidate_stream(state)
         else:
-            return make_follower_stream(next_state)
+            return make_follower_stream(state)
     return Stream(state, rest)
 
 def make_candidate_stream(state):
@@ -187,15 +186,14 @@ def make_candidate_stream(state):
     election_timeout = datagram_stream.stopped
     state = reduce_stream(candidate_handle_datagram, datagram_stream, state)
     def rest():
-        next_state = state.ctx.get('on_next', lambda n:n)(state)
         if election_timeout:
-            return make_candidate_stream(next_state)
-        elif next_state.ctx['server_state'] == 'follower':
+            return make_candidate_stream(state)
+        elif state.ctx['server_state'] == 'follower':
             logger.debug('convert to follower.')
-            return make_follower_stream(initialize_follower(next_state))
-        elif next_state.ctx['server_state'] == 'leader':
+            return make_follower_stream(initialize_follower(state))
+        elif state.ctx['server_state'] == 'leader':
             logger.debug('convert to leader.')
-            return make_leader_stream(initialize_leader(next_state))
+            return make_leader_stream(initialize_leader(state))
     return Stream(state, rest)
 
 def make_leader_stream(state):
@@ -203,12 +201,11 @@ def make_leader_stream(state):
     datagram_stream = keep_receiving(state.ctx['udp_server'], 0.3)
     state = reduce_stream(leader_handle_datagram, datagram_stream, state)
     def rest():
-        next_state = state.ctx.get('on_next', lambda n:n)(state)
-        if next_state.ctx['server_state'] == 'follower':
+        if state.ctx['server_state'] == 'follower':
             logger.debug('convert to follower')
-            return make_follower_stream(initialize_follower(next_state))
+            return make_follower_stream(initialize_follower(state))
         else:
-            return make_leader_stream(next_state)
+            return make_leader_stream(state)
     return Stream(state, rest)
 
 def append_entries(state):
@@ -391,16 +388,7 @@ def leader_handle_append_entries_response(state, datagram):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
     bind, peers = sys.argv[1], sys.argv[2:]
-
-    def on_next(state):
-        if state.ctx['server_state'] == 'leader':
-            state = state.to(
-                log=state.log+[{'term': state.current_term, 'cmd': {'demo': time()}}]
-            )
-        logger.debug(f"{state.ctx['server_state']} state_machine: {state.ctx['state_machine']}")
-        return state
-
-    state = init_raft_state({'bind': bind, 'peers': peers, 'on_next': on_next})
+    state = init_raft_state({'bind': bind, 'peers': peers,})
     logger.info(f'server started at {state.ctx["bind"]}')
     stream = make_raft_server(state)
     while not stream.stopped:
